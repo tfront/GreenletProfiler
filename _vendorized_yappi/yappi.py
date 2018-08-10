@@ -2,22 +2,21 @@
  yappi.py
  Yet Another Python Profiler
 
- Sumer Cip 2013
+ Sumer Cip 2014
 """
 import os
 import sys
-# Yappi's C extension, _yappi.so, which we've renamed to
-# _GreenletProfiler_yappi.so to avoid any confusion if both
-# GreenletProfiler and Yappi are installed.
-import _GreenletProfiler_yappi as _yappi
+import _yappi
 import pickle
 import marshal
 import threading
+import warnings
+from collections import defaultdict
         
 class YappiError(Exception): pass
 
 __all__ = ['start', 'stop', 'get_func_stats', 'get_thread_stats', 'clear_stats', 'is_running',
-           'get_clock_type', 'set_clock_type',  'get_mem_usage']
+           'get_clock', 'get_clock_type', 'set_clock_type',  'get_mem_usage']
            
 CRLF = '\n'
 COLUMN_GAP = 2
@@ -101,7 +100,17 @@ cumulative_time (total time) = ttot
 
 Other than that we hold called functions in a profile entry as named 'children'. On the
 other hand, PSTAT expects to have a dict of callers of the function. So we also need to 
-convert the information to that.       
+convert children to callers dict.
+From Python Docs:
+'''
+With cProfile, each caller is preceded by three numbers: 
+the number of times this specific call was made, and the total 
+and cumulative times spent in the current function while it was 
+invoked by this specific caller.
+'''
+That means we only need to assign ChildFuncStat's ttot/tsub values to the caller
+properly. Docs indicate that when b() is called by a() pstat holds the total time
+of b() when called by a, just like yappi.
 
 PSTAT only expects to have the above dict to be saved.
 """
@@ -125,14 +134,9 @@ def convert2pstats(stats):
     _pdict = {}
     
     # convert callees to callers
-    _callers = {}
-    for fs in stats:
-        if not fs in _callers:
-            _callers[fs] = {}
-            
-        for ct in fs.children:
-            if not ct in _callers:
-                _callers[ct] = {}
+    _callers = defaultdict(dict)
+    for fs in stats:            
+        for ct in fs.children:            
             _callers[ct][pstat_id(fs)] = (ct.ncall, ct.nactualcall, ct.tsub ,ct.ttot)
     
     # populate the pstat dict.
@@ -141,30 +145,62 @@ def convert2pstats(stats):
      
     return pstats.Stats(_PStatHolder(_pdict))
     
+def profile(clock_type="cpu", profile_builtins=False, complete_callback=None):
+    """
+    A profile decorator that can be used to profile a single call.
+    
+    We need to clear_stats() on entry/exit of the function unfortunately. 
+    As yappi is a per-interpreter resource, we cannot simply resume profiling
+    session upon exit of the function, that is because we _may_ simply change
+    start() params which may differ from the paused session that may cause instable
+    results. So, if you use a decorator, then global profiling may return bogus 
+    results or no results at all.
+    """
+    def _profile_dec(func):            
+        def wrapper(*args, **kwargs):
+            clear_stats()
+            set_clock_type(clock_type)
+            start(profile_builtins, profile_threads=False)            
+            try:
+                return func(*args, **kwargs)
+            finally:
+                try:
+                    stop()
+                    if complete_callback is None:
+                        get_func_stats().print_all()
+                    else:
+                        complete_callback(func, get_func_stats())
+                finally:
+                    clear_stats()            
+        return wrapper
+    return _profile_dec    
     
 class StatString(object):
     """
     Class to prettify/trim a profile result column.
     """
-    _s = ""
     _TRAIL_DOT = ".."
+    _LEFT = 1
+    _RIGHT = 2
 
     def __init__(self, s):
         self._s = str(s)
-
+    
+    def _trim(self, length, direction):        
+        if (len(self._s) > length):
+            if direction == self._LEFT:
+                self._s = self._s[-length:]
+                return self._TRAIL_DOT + self._s[len(self._TRAIL_DOT):]
+            elif direction == self._RIGHT:
+                self._s = self._s[:length]
+                return self._s[:-len(self._TRAIL_DOT)] + self._TRAIL_DOT
+        return self._s + (" " * (length - len(self._s)))
+    
     def ltrim(self, length):
-        if len(self._s) > length:
-            self._s = self._s[-length:]
-            return self._TRAIL_DOT + self._s[len(self._TRAIL_DOT):]
-        else:
-            return self._s + " " * (length - len(self._s))
-
+        return self._trim(length, self._LEFT)
+            
     def rtrim(self, length):
-        if len(self._s) > length:
-            self._s = self._s[:length]
-            return self._s[:-len(self._TRAIL_DOT)] + self._TRAIL_DOT
-        else:
-            return self._s + (" " * (length - len(self._s)))
+        return self._trim(length, self._RIGHT)
 
 class YStat(dict):
     """
@@ -175,10 +211,9 @@ class YStat(dict):
     
     def __init__(self, values):
         super(YStat, self).__init__()
-        
-        assert len(self._KEYS) == len(values)
-        for i in range(len(self._KEYS)):
-            setattr(self, self._KEYS[i], values[i])
+            
+        for i, key in enumerate(self._KEYS):
+            setattr(self, key, values[i])
             
     def __setattr__(self, name, value):
         if name in self._KEYS:
@@ -226,8 +261,9 @@ class YFuncStat(YStat):
         return self.ncall != self.nactualcall
 
     def strip_dirs(self):
-        self.full_name = _func_fullname(self.builtin, os.path.basename(self.module), 
-            self.lineno, self.name)
+        self.module = os.path.basename(self.module)
+        self.full_name = _func_fullname(self.builtin, self.module, self.lineno, 
+            self.name)
         return self    
         
 class YChildFuncStat(YFuncStat):
@@ -258,61 +294,48 @@ class YThreadStat(YStat):
             return False
         return self.id == other.id
 
-class YStats(object):
+class YStats(list):
     """
     Main Stats class where we collect the information from _yappi and apply the user filters.
     """
     def __init__(self):
-        self._stats = []
         self._clock_type = None
         
     def get(self):
-        self._clock_type = _yappi.get_clock_type()["type"]
+        self._clock_type = _yappi.get_clock()["type"]
         return self.sort(DEFAULT_SORT_TYPE, DEFAULT_SORT_ORDER)
         
-    def sort(self, sort_type, sort_order):
-        self._stats.sort(key=lambda stat: stat[sort_type], reverse=(sort_order==SORT_ORDERS["desc"]))
+    def sort(self, sort_type, sort_order):        
+        super(YStats, self).sort(key=lambda stat: stat[sort_type], reverse=(sort_order==SORT_ORDERS["desc"]))
         return self
         
     def clear(self):
-        self._stats = []
+        del self[:]
     
     def empty(self):
-        return (len(self._stats) == 0)
-                
-    def __iter__(self):
-        for stat in self._stats:
-            yield stat
-
-    def __repr__(self):
-        return str(self._stats)
-        
-    def __len__(self):
-        return len(self._stats)
+        return (len(self) == 0)
         
     def __getitem__(self, key):
         try:
-            return self._stats[key]
+            return super(YStats, self).__getitem__(key)
         except IndexError:
             return None
     
     def append(self, item):
         # sometimes, we may have Stat object that seems to be unique, however
         # it may already be in the list.
-        try:
-            idx = self._stats.index(item)
-            citem = self._stats[idx]
-        except ValueError:
-            self._stats.append(item)
-            return
-        citem += item
-    
+        for cstat in self:
+            if cstat == item: 
+                cstat += item
+                return        
+        super(YStats, self).append(item)
+                
     def _debug_check_sanity(self):
         """
         Check for basic sanity errors in stats. e.g: Check for duplicate stats.
         """
         for x in self:
-            if self._stats.count(x) > 1:
+            if self.count(x) > 1:
                 return False
         return True
             
@@ -428,20 +451,23 @@ class YFuncStats(YStats):
                 stat.children = _childs            
             result = super(YFuncStats, self).get()            
         finally:
-            _yappi._resume()            
+            _yappi._resume()
         return result
     
     def _enumerator(self, stat_entry):
         
+        fname, fmodule, flineno, fncall, fnactualcall, fbuiltin, fttot, ftsub, \
+            findex, fchildren = stat_entry 
+        
         # builtin function?
-        full_name = _func_fullname(bool(stat_entry[5]), stat_entry[1], stat_entry[2], stat_entry[0])                    
-        tavg = stat_entry[6] / stat_entry[3]
-        fstat = YFuncStat(stat_entry + (tavg, full_name))
+        ffull_name = _func_fullname(bool(fbuiltin), fmodule, flineno, fname)                    
+        ftavg = fttot / fncall
+        fstat = YFuncStat(stat_entry + (ftavg, ffull_name))
         
         # do not show profile stats of yappi itself.
         if os.path.basename(fstat.module) == "yappi.py" or fstat.module == "_yappi":
             return
-            
+        
         fstat.builtin = bool(fstat.builtin)                
         self.append(fstat)
         
@@ -484,12 +510,9 @@ class YFuncStats(YStats):
             saved_stat_in_curr += saved_stat
                         
     def _save_as_YSTAT(self, path):
-        file = open(path, "wb")
-        try:
-            pickle.dump((self._stats, self._clock_type), file, YPICKLE_PROTOCOL)
-        finally:
-            file.close()
-            
+        with open(path, "wb") as f:
+            pickle.dump((self, self._clock_type), f, YPICKLE_PROTOCOL)
+        
     def _save_as_PSTAT(self, path):   
         """
         Save the profiling information as PSTAT.
@@ -533,11 +556,8 @@ class YFuncStats(YStats):
                                 ]
             lines += func_stats
             
-        file = open(path, "w")
-        try:
-            file.write('\n'.join(lines))                
-        finally:
-            file.close()
+        with open(path, "w") as f:
+            f.write('\n'.join(lines))                
             
     def add(self, files, type="ystat"):    
         type = type.upper()
@@ -546,12 +566,9 @@ class YFuncStats(YStats):
         if isinstance(files, str):
             files = [files, ]
         for fd in files:
-            f = open(fd, "rb")
-            try:
+            with open(fd, "rb") as f:
                 add_func = getattr(self, "_add_from_%s" % (type))
-                add_func(file=f)
-            finally:
-                f.close()
+                add_func(file=f)            
             
         return self.sort(DEFAULT_SORT_TYPE, DEFAULT_SORT_ORDER)
             
@@ -746,12 +763,21 @@ def clear_stats():
     finally:
         _yappi._resume()
     
-def get_clock_type():
+def get_clock():
     """
-    Returns the OS api used for timing plus the precision and the clock type information in a dict.
+    Returns a dict containing the OS API used for timing, the precision, the
+    clock type, and the current tick count
     """
-    return _yappi.get_clock_type()
+    return _yappi.get_clock()
     
+def get_clock_type():
+    warnings.warn("get_clock_type is deprecated - use get_clock",
+                  DeprecationWarning, stacklevel=2)
+
+    result = _yappi.get_clock()
+    result.pop('time')
+    return result
+
 def set_clock_type(type):
     """
     Sets the internal clock type for timing. Profiler shall not have any previous stats.
