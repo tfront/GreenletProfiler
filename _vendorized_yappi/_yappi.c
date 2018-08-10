@@ -105,6 +105,18 @@ static PyObject *test_timings; // used for testing
 #define PyStr_FromFormatV(fmt, vargs) PyString_FromFormatV(fmt, vargs)
 #endif
 
+static void print(const char *s) {
+    char buf[1024];
+    sprintf(buf, "print '%s'", s);
+    PyRun_SimpleString(buf);
+}
+
+static void print_thread_info(long long tickcount, char *status) {
+    char buf[256];
+    sprintf(buf, "thread id: [%d] at %s, tick count: [%lld]", mach_thread_self(), status, tickcount);
+    print(buf);
+}
+
 // forwards
 static _ctx * _profile_thread(PyThreadState *ts);
 
@@ -543,7 +555,14 @@ _get_frame_elapsed(void)
         }
         
     } else {
-        result = tickcount() - ci->t0;
+        char buf[1024];
+        long long tc = tickcount();
+        long long old = ci->t0;
+        result = tc - old;
+        if (result < 0) {
+            sprintf(buf, "get negative result for context %ld(%d): old is %lld, new is %lld", current_ctx->id, mach_thread_self(), old, tc);
+            print(buf);
+        }
     }
     
     return result;
@@ -1353,7 +1372,7 @@ PyMODINIT_FUNC
 #ifdef IS_PY3K
 PyInit__yappi(void)
 #else
-init_yappi(void)
+init_GreenletProfiler_yappi(void)
 #endif
 {
     PyObject *m, *d;
@@ -1363,7 +1382,7 @@ init_yappi(void)
     if (m == NULL)
         return NULL;
 #else
-    m = Py_InitModule("_yappi",  yappi_methods);
+    m = Py_InitModule("_GreenletProfiler_yappi",  yappi_methods);
     if (m == NULL)
         return;
 #endif
